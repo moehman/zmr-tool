@@ -140,6 +140,36 @@ $ zmr -z 'void foo() {_}' -t templates/foo_body.c -x 'tr a-z A-Z' < hello.c -p0
   PRINTF("GOODBYE!\N");
 ```
 
+The special value ':' for an empty template was inspired by the : no-op shell command. These two are equivalent except that the -t parameter does not launch an external process:
+```
+$ zmr -z 'void foo( ) {}' -x ':' hello.c -p0    # removes the foo() function with a process the returns nothing
+$ zmr -z 'void foo( ) {}' -t ':' hello.c -p0    # removes the foo() function by substitution with an empty template
+```
+
+### 2.3 Working with Archive Files
+
+Editing a file inside a zip archive (change the -p0 flag to -i flag to actually write the changes to the archive):
+```
+$ zmr -a test.zip -z 'function hello() {_}' -r 's/TODO/DONE/' src/main.js -p0
+{
+    // DONE: improve this
+    console.log("hello world");
+}
+```
+
+In addition to .zip files, also tar and .tar.gz files are supported. It is also possible to peek inside archives without even specifying any zoom patterns or translations:
+```
+$ zmr -a test.tar.gz src/main.js
+function hello() {
+    // TODO: improve this
+    console.log("hello world");
+}
+
+function goodbye() {
+    console.log("goodbye");
+}
+```
+
 ---
 
 ## 3. Command-line Options
