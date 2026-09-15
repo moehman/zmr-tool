@@ -89,6 +89,24 @@ $ zmr -z 'if ($x) {} elseif ($y) {_} else {}' < elseif.php -p0
   }
 ```
 
+Instead of the regular zoom patters, a similar effect can be achieved with the -s (--start) and -e (--end) options:
+```
+$ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p0
+<A>  # 2 OPEN
+    <B></B>  # 3 OPEN AND CLOSE
+  </A>
+```
+
+There are far better tools for processing XML files and the purpose of these examples is to show that the concept of nested regions maps cleanly tree-like structures:
+```
+$ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p1
+<a>  # 1 open
+  <A>  # 2 OPEN
+    <B></B>  # 3 OPEN AND CLOSE
+  </A>  # 2 close
+</a>
+```
+
 ### 2.2 Transforming
 
 We can pipe the selected region through an external command with the -x (--exec) option:
