@@ -1,0 +1,5 @@
+<a>  # 1 open
+  <a>  # 2 open
+    <b></b>  # 3 open and close
+  </a>  # 2 close
+</a>  # 1 close
