@@ -420,9 +420,9 @@ def match_start_end(text, escaped_text, search_start, search_end, od, cd, debug)
                 region_end = i + len(m_cd.group())
                 region_text = text[region_start:region_end]
 
-                # Extend to trailing newline using escaped_text
+                # Extend to trailing newline using normal text (where start/end patterns matched)
                 extended_end = extend_match_for_trailing_newline(
-                    escaped_text, region_end, search_end
+                    text, region_end, search_end
                 )
                 region_end = extended_end
 
