@@ -97,7 +97,7 @@ $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p0
   </A>
 ```
 
-There are far better tools for processing XML files and the purpose of these examples is to show that the concept of nested regions maps cleanly tree-like structures:
+There are far better tools for processing XML files and the purpose of these examples is to show that the concept of nested regions maps cleanly to tree-like structures:
 ```
 $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p1
 <a>  # 1 open
