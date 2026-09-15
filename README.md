@@ -15,41 +15,112 @@ zmr (zoomer) is a zoom-and-replace tool for navigating and transforming nested c
 
 ---
 
-## 2. Key Features - v6.0.2
+## 2. Examples
 
-### 2.1 Multi-Encoding Support
+### 2.1 Zooming
 
-zmr implements a 3-tier encoding strategy for handling mixed-encoding environments:
+Preview mode (-p0) shows the matched region in red color (which not supported by the .md format):
+```bash
+$ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c -p0
+{
+    printf("WORLD\n");
+  }
+```
 
-#### Tier I: UTF-8 (standard case)
-- If input file is valid UTF-8, process and output as UTF-8
-- No encoding warnings or changes
-- Covers most use cases
+Preview mode (-p1) shows the matched region in red and the surrounding region in green so we see a little more context:
+```
+$ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c -p1
+{
+  while (i--) {
+    printf("WORLD\n");
+  }
+}
+```
 
-#### Tier II: Latin-1 Preservation (legacy support)
-- If UTF-8 decode fails, fall back to Latin-1 (always succeeds)
-- Process internally as UTF-8 strings (Python 3 strings are Unicode)
-- Attempt to encode output back to original Latin-1 encoding
-- If successful, output preserves original encoding (no change)
-- Covers use cases involving legacy/Windows files
+If we drop the underscore from the patterns, we get a slightly larger match which is best illustrated in the preview mode (-p0):
+```
+$ zmr -z 'void bar(int i) {}' -z 'while (i--) {}' -r 's/world/WORLD/' hello.c -p0
+while (i--) {
+    printf("WORLD\n");
+  }
+```
 
-#### Tier III: UTF-8 with Warning (edge cases)
-- If Tier II encode fails (transformation introduced non-Latin-1 characters)
-- Output as UTF-8 with warning to stderr
-- Warning message: `WARNING: {filename}: output contains characters outside LATIN-1, converting to UTF-8`
-- Covers rare edge cases (Latin-1 input + UTF-8 template/replacement)
+Again, preview mode (-p1) shows not only the matching region (in red) but also the surrounding region (in green):
+```
+$ zmr -z 'void bar(int i) {}' -z 'while (i--) {}' -r 's/world/WORLD/' hello.c -p1
+void bar(int i) {
+  while (i--) {
+    printf("WORLD\n");
+  }
+}
+```
 
-### 2.2 BOM Stripping
+Mixing different delimiter types together in zoom patterns is not allowed:
+```
+$ zmr -z 'void foo() {}' -r 's/hello/HELLO/' hello.c -p0
+ERROR: Definition contains multiple marker types
+```
 
-- UTF-8 BOM (Byte Order Mark, U+FEFF) is automatically stripped from template files
-- Prevents BOM duplication when templates are used
-- Both file-based and stdin templates are cleaned
+If we want to match a literal '()' from the file, we can write it with an extra space in between, i.e. '( )', because the zoom pattern matching engine ignores white space unless it introduces a new word boundaries just like many compilers do:
+```
+$ zmr -z 'void foo( ) {}' -r 's/hello/HELLO/' hello.c -p0
+void foo() {
+  printf("HELLO!\n");
+}
+```
 
-### 2.3 Archive Member Encoding
+Leaving out the underscore from the zoom patterns means that whole pattern is matched from start to finish:
+```
+$ zmr -z 'if ($x) {} elseif ($y) {} else {}' < elseif.php -p0
+if ($x) {
+    cmd1();
+  } elseif ($y) {
+    cmd2();
+  } else {
+    cmd3();
+  }
+```
 
-- Each archive member follows the same 3-tier encoding strategy
-- Independent detection and conversion per member
-- If a file is converted to UTF-8 as a result of a transformation, member is converted with warning
+By contrast, adding a single underscore to the zoom pattern we can zoom into that specific branch:
+```
+$ zmr -z 'if ($x) {} elseif ($y) {_} else {}' < elseif.php -p0
+{
+    cmd2();
+  }
+```
+
+### 2.2 Transforming
+
+We can pipe the selected region through an external command with the -x (--exec) option:
+```
+$ zmr -z 'int main(int argc, char *argv[]) {_}' -z 'if (strcmp(argv[1], "help") == 0) {_}' -x 'tr a-z A-Z' < hello.c -p1
+{
+  foo();
+  bar(5);
+  baz();
+
+  if (argc > 1) {
+    if (strcmp(argv[1], "help") == 0) {
+      PRINTF("HELP REQUESTED!\N");
+    }
+  } /* if */
+  return 0;
+}
+```
+
+Templates can be read from a file or from stdin just like the input files:
+```
+$ zmr -z 'void foo() {_}' -t templates/foo_body.c < hello.c -p0
+  printf("goodbye!\n");
+$ zmr -z 'void foo() {_}' -t - < templates/foo_body.c hello.c -p0
+  printf("goodbye!\n");
+```
+
+Templates can also be followed by other transformations:
+```
+$ zmr -z 'void foo() {_}' -t templates/foo_body.c -x 'tr a-z A-Z' < hello.c -p0
+  PRINTF("GOODBYE!\N");
+```
 
 ---
 
@@ -306,7 +377,45 @@ zmr distinguishes itself by enabling multi-level nested navigation akin to compi
 
 ---
 
-## 14. Version History
+## 14. Key Features - v6.0.2
+
+### 14.1 Multi-Encoding Support
+
+zmr implements a 3-tier encoding strategy for handling mixed-encoding environments:
+
+#### Tier I: UTF-8 (standard case)
+- If input file is valid UTF-8, process and output as UTF-8
+- No encoding warnings or changes
+- Covers most use cases
+
+#### Tier II: Latin-1 Preservation (legacy support)
+- If UTF-8 decode fails, fall back to Latin-1 (always succeeds)
+- Process internally as UTF-8 strings (Python 3 strings are Unicode)
+- Attempt to encode output back to original Latin-1 encoding
+- If successful, output preserves original encoding (no change)
+- Covers use cases involving legacy/Windows files
+
+#### Tier III: UTF-8 with Warning (edge cases)
+- If Tier II encode fails (transformation introduced non-Latin-1 characters)
+- Output as UTF-8 with warning to stderr
+- Warning message: `WARNING: {filename}: output contains characters outside LATIN-1, converting to UTF-8`
+- Covers rare edge cases (Latin-1 input + UTF-8 template/replacement)
+
+### 14.2 BOM Stripping
+
+- UTF-8 BOM (Byte Order Mark, U+FEFF) is automatically stripped from template files
+- Prevents BOM duplication when templates are used
+- Both file-based and stdin templates are cleaned
+
+### 14.3 Archive Member Encoding
+
+- Each archive member follows the same 3-tier encoding strategy
+- Independent detection and conversion per member
+- If a file is converted to UTF-8 as a result of a transformation, member is converted with warning
+
+---
+
+## 15. Version History
 
 ### v6.0.2 (Latest)
 
