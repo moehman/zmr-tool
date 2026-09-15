@@ -1,0 +1,1180 @@
+#!/usr/bin/env python3
+r"""
+zmr (zoomer) - Zoom-and-Replace Tool
+
+Usage:
+    zmr [-z DEF ...] [-s PAT] [-e PAT] [-r EXPR ...] [-l EXPR ...] [-x CMD ...]
+        [-t TEMPLATE] [-p LEVELS] [-a ARCHIVE] [-i[SUFFIX]] [-d] [FILE ...]
+
+Options:
+    -z DEF, --zoom DEF
+                 Zoom into a region (repeatable, outermost to innermost).
+                 DEF syntax: 'if (x) {} else {_}'  or  'cmd(_)'  or  '{_}'  or  'token'
+                 Note: to match 'foo() {...}' you can specify 'foo( ) {}' as whitespace
+                 is ignored between tokens.
+
+    -s PAT, --start PAT
+                 Special start delimiter for zooming. Used together with the --end option.
+
+    -e PAT, --end PAT
+                 Special end delimiter for zooming. Used together with the --start option.
+
+    -r EXPR, --regex EXPR
+                 Regex substitution on innermost region: s<delim>pattern<delim>repl<delim>[gi]
+                 Any char except backslash can be delimiter: s/x/y/g  s#x#y#  s|x|y|i
+
+    -l EXPR, --literal EXPR
+                 Literal (string.replace) substitution: s<delim>text<delim>repl<delim>[gi]
+                 Like -r but pattern is matched literally, not as a regex.
+
+    -x CMD, --exec CMD
+                 Pipe innermost region through a shell command.
+
+    -t TEMPLATE, --template TEMPLATE
+                 Replace innermost region with TEMPLATE file contents.
+                 Special values:
+                   ':'  kill region (replace with empty string)
+                   '-'  read from stdin (only when input files are given explicitly)
+                 Can be followed by -r/-l/-x for template rendering (placeholder substitution).
+
+    -p LEVELS, --preview LEVELS
+                 Preview mode: show colored regions, do not write files.
+                 0 = only innermost (RED)
+                 1 = innermost (RED) + next (GREEN)
+                 2 = innermost (RED) + next (GREEN) + next (BLUE)
+                 3+ = further levels in NORMAL color
+
+    -a ARCHIVE, --archive ARCHIVE
+                 Read FILE arguments from inside an archive. Supported formats:
+                   .tar, .tar.gz / .tgz, .tar.bz2 / .tbz2  (tar archives)
+                   .zip                                      (zip archives)
+                 With -i, write modified files back to the archive atomically.
+                 Without -i, write to stdout.
+
+    -i [SUFFIX], --in-place [=SUFFIX]
+                 Edit files in place (filesystem) or in archive (with -a).
+                 Optional SUFFIX creates a backup of the archive. Cannot be combined with -p.
+
+    -d, --debug  Print escaped text to stderr (for debugging).
+
+Transforms (-r, -l, -x) are applied in the order given, all to the innermost region.
+Delimiter escaping: s/foo\/bar/baz/  -->  pattern is foo/bar
+
+Exit codes:
+    0  = success (no transforms, or at least one substitution matched)
+    1  = transforms specified but no substitution matched
+    2  = error
+
+Examples:
+    zmr -z 'function bar() {_}' -z 'if (x) {} else {_}' -p2 < file.php
+    zmr -z 'function bar() {_}' -r 's/foo/bar/g' file.php
+    zmr -z 'if (x) {_}' -l 's/OldName/NewName/i' -r 's/TODO/DONE/' file.js
+    zmr -z 'main() {_}' -x 'tr a-z A-Z' file.c
+    zmr -z '{_}' -p0 file.php
+    zmr -z 'if (strcmp(argv[1], "help") == 0) {}' -p0 file.c
+    zmr -z 'function getBackups() {}' -a archive.tar.gz src/file.php -i -t patch.php
+    zmr -z 'function getBackups() {}' -r 's/__DATE__/2026-09-02/' src/file.php -i -t - <<< "$PATCH"
+    zmr -a archive.zip -z 'function foo() {_}' -r 's/old/new/g' src/main.js -i
+
+Version: 6.0.2
+"""
+
+import sys, os, io, tempfile, subprocess, re, argparse, tarfile, zipfile
+
+
+class RegionNotFoundError(Exception):
+    """Raised when zoom definitions do not match anything in the input."""
+    pass
+
+__version__ = '6.0.2'
+COLORS  = ["\033[91m", "\033[92m", "\033[94m"]
+RESET   = "\033[0m"
+
+
+# -- Escaping ----------------------------------------------------------------
+
+def escape_literals(text):
+    """Escape literals using equal-length placeholders. Returns only escaped_text."""
+    escaped_parts = []
+    i = 0
+
+    while i < len(text):
+        if text[i] in ('"', "'"):
+            quote = text[i]
+            start = i
+            i += 1
+            while i < len(text):
+                if text[i] == '\\' and i + 1 < len(text):
+                    i += 2
+                elif text[i] == quote:
+                    i += 1
+                    break
+                else:
+                    i += 1
+            escaped_parts.append(' ' * (i - start))
+            continue
+
+        if text[i:i+2] == '/*':
+            start = i
+            i += 2
+            while i + 1 < len(text):
+                if text[i:i+2] == '*/':
+                    i += 2
+                    break
+                i += 1
+            escaped_parts.append(' ' * (i - start))
+            continue
+
+        if text[i:i+2] == '//' or text[i] == '#':
+            start = i
+            while i < len(text) and text[i] != '\n':
+                i += 1
+            escaped_parts.append(' ' * (i - start))
+            continue
+
+        start = i
+        while i < len(text):
+            if text[i] in ('"', "'") or text[i:i+2] in ('/*', '//') or text[i] == '#':
+                break
+            i += 1
+        escaped_parts.append(text[start:i])
+
+    escaped_text = "".join(escaped_parts)
+
+    assert len(escaped_text) == len(text)
+    return escaped_text
+
+
+# -- Delimiter Scanner -------------------------------------------------------
+
+def find_balanced_delimiters(text, open_d, close_d, start_pos=0):
+    pos = text.find(open_d, start_pos)
+    if pos == -1:
+        return None
+
+    i = pos + len(open_d)
+    depth = 0
+
+    while i <= len(text):
+        if i + len(open_d) <= len(text) and text[i:i+len(open_d)] == open_d:
+            depth += 1
+            i += len(open_d)
+        elif i + len(close_d) <= len(text) and text[i:i+len(close_d)] == close_d:
+            if depth == 0:
+                return (text[pos:i+len(close_d)], pos, i+len(close_d))
+            depth -= 1
+            i += len(close_d)
+        else:
+            i += 1
+
+    return None
+
+
+# -- Substitution parsing ----------------------------------------------------
+
+def parse_substitution_expr(expr):
+    if not expr or expr[0] != 's':
+        raise ValueError(f"Expression must start with 's': {expr!r}")
+    if len(expr) < 4:
+        raise ValueError(f"Expression too short: {expr!r}")
+
+    delim = expr[1]
+    if delim == '\\':
+        raise ValueError("Backslash cannot be used as delimiter")
+
+    parts = ['']
+    i = 2
+    while i < len(expr):
+        c = expr[i]
+        if c == '\\' and i + 1 < len(expr):
+            nxt = expr[i + 1]
+            if nxt == delim:
+                parts[-1] += delim
+                i += 2
+            elif nxt == '\\':
+                parts[-1] += '\\'
+                i += 2
+            else:
+                parts[-1] += c + nxt
+                i += 2
+        elif c == delim:
+            parts.append('')
+            i += 1
+        else:
+            parts[-1] += c
+            i += 1
+
+    if len(parts) < 3:
+        raise ValueError(f"Expression needs pattern and replacement")
+
+    pattern = parts[0]
+    replacement = parts[1]
+    flags_str = parts[2] if len(parts) > 2 else ''
+
+    invalid = set(flags_str) - set('gi')
+    if invalid:
+        raise ValueError(f"Invalid flags {invalid!r} (supported: g i)")
+
+    return pattern, replacement, flags_str
+
+
+# -- Transform functions -----------------------------------------------------
+
+def apply_regex_transform(text, expr):
+    pattern, replacement, flags_str = parse_substitution_expr(expr)
+    re_flags = re.IGNORECASE if 'i' in flags_str else 0
+    try:
+        if 'g' in flags_str:
+            result, n = re.subn(pattern, replacement, text, flags=re_flags)
+        else:
+            result, n = re.subn(pattern, replacement, text, count=1, flags=re_flags)
+    except re.error as e:
+        raise ValueError(f"Invalid regex pattern {pattern!r}: {e}")
+    return result, n > 0
+
+
+def apply_literal_transform(text, expr):
+    pattern, replacement, flags_str = parse_substitution_expr(expr)
+    re_flags = re.IGNORECASE if 'i' in flags_str else 0
+    escaped = re.escape(pattern)
+    if 'g' in flags_str:
+        result, n = re.subn(escaped, replacement, text, flags=re_flags)
+    else:
+        result, n = re.subn(escaped, replacement, text, count=1, flags=re_flags)
+    return result, n > 0
+
+
+def apply_exec_transform(text, cmd):
+    try:
+        proc = subprocess.run(cmd, shell=True, input=text, capture_output=True, text=True)
+    except OSError as e:
+        raise ValueError(f"Failed to run {cmd!r}: {e}")
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        raise ValueError(f"Command {cmd!r} exited {proc.returncode}" + (f": {err}" if err else ""))
+    return proc.stdout, proc.stdout != text
+
+
+
+
+def apply_template_transform(file_path):
+    """
+    Replace region with contents of file_path.
+    ':' is a special value meaning kill region (replace with empty string).
+    Always returns matched=True (replacing the region is always a successful match).
+    """
+    if file_path == ':':
+        return '', True
+    if file_path == '-':
+        content = safe_decode_simple(sys.stdin.buffer.read())
+        return strip_bom(content), True
+    try:
+        with open(file_path, 'rb') as fh:
+            content = safe_decode_simple(fh.read())
+        content = strip_bom(content)
+        return content, True
+    except OSError as e:
+        raise RuntimeError(f"Cannot read -t template {file_path!r}: {e}")
+
+# -- Pattern helpers ---------------------------------------------------------
+
+def make_flexible_pattern(identifier):
+    atoms = re.findall(r'\w+|[^\w\s]', identifier)
+    if not atoms:
+        return re.escape(identifier)
+    parts = [re.escape(atoms[0])]
+    for i in range(1, len(atoms)):
+        prev, curr = atoms[i - 1], atoms[i]
+        sep = r'\s+' if (re.fullmatch(r'\w+', prev) and re.fullmatch(r'\w+', curr)) else r'\s*'
+        parts.append(sep)
+        parts.append(re.escape(curr))
+    pat = ''.join(parts)
+    if re.fullmatch(r'\w+', atoms[0]):  pat = r'(?<!\w)' + pat
+    if re.fullmatch(r'\w+', atoms[-1]): pat = pat + r'(?!\w)'
+    return pat
+
+
+def parse_definition_with_marker(definition):
+    marker_info = None
+    marker_delim = None
+    all_inclusive = False
+
+    for ms, (od, cd) in [('{_}', ('{','}')), ('(_)', ('(',')')), ('[_]', ('[',']'))]:
+        if ms in definition:
+            if marker_info is not None:
+                raise ValueError("Definition contains multiple marker types")
+            marker_info = ms
+            marker_delim = (od, cd)
+
+    if marker_info is None:
+        for ms, (od, cd) in [('{}', ('{','}')), ('()', ('(',')')), ('[]', ('[',']'))]:
+            if ms in definition:
+                if marker_info is not None:
+                    raise ValueError("Definition contains multiple marker types")
+                marker_info = ms
+                marker_delim = (od, cd)
+                all_inclusive = True
+
+    if marker_info is None:
+        raise ValueError("Definition contains no marker types")
+
+    if definition in ('{_}', '(_)', '[_]', '{}', '()', '[]'):
+        od, cd = marker_delim
+        return [(None, od, cd, True, all_inclusive, False)]
+
+    od, cd = marker_delim
+    work = definition.replace(marker_info, '__MARKER__').replace(od + cd, '__DELIM__')
+    parts = re.split(r'(__MARKER__|__DELIM__)', work)
+
+    sequence = []
+    for part in parts:
+        if part == '__MARKER__':
+            sequence.append((None, od, cd, True, all_inclusive, False))
+        elif part == '__DELIM__':
+            sequence.append((None, od, cd, all_inclusive, all_inclusive, False))
+        elif part.strip():
+            sequence.append((part.strip(), None, None, all_inclusive, all_inclusive, False))
+
+    if not sequence:
+        raise ValueError(f"Could not parse definition: {definition!r}")
+
+    return sequence
+
+
+# -- Match Extension --------------------------------------------------------
+
+def extend_match_for_trailing_newline(text, region_end, search_end):
+    """
+    Extend region to include trailing whitespace and newline.
+
+    Trailing whitespace = space/tab/form-feed immediately before newline.
+    """
+    end = region_end
+
+    while end < search_end:
+        ch = text[end]
+        if ch == '\n':
+            return end + 1
+        elif ch in ' \t\f\r':
+            end += 1
+        else:
+            return region_end
+
+    return region_end
+
+
+# -- Navigation -------------------------------------------------------------
+
+def match_token(text, search_start, search_end, token, debug):
+    # Token matching (in normal_text). Returns (text, start, end, inner_start).
+    pattern = make_flexible_pattern(token)
+    bounded = text[search_start:search_end]
+    match   = re.search(pattern, bounded, flags=re.DOTALL)
+
+    if not match:
+        if debug:
+            print(f"  TOKEN {token}: NO MATCH", file=sys.stderr)
+        return None
+
+    region_text  = match.group()
+    region_start = search_start + match.start()
+    region_end   = search_start + match.end()
+
+    if debug:
+        print(f"  TOKEN {token}: [{region_start}:{region_end}]", file=sys.stderr)
+
+    return (region_text, region_start, region_end)
+
+def match_start_end(text, escaped_text, search_start, search_end, od, cd, debug):
+    # Search for start and end patterns in normal_text with balanced nesting
+    # (for --start/--end delimiters)
+
+    start_pattern = make_flexible_pattern(od)
+    m_start = re.search(start_pattern, text[search_start:search_end], flags=re.DOTALL)
+
+    if not m_start:
+        if debug:
+            print(f"  START {od!r}: NO MATCH", file=sys.stderr)
+        return None
+
+    region_start = search_start + m_start.start()
+    inner_start = region_start + (m_start.end() - m_start.start())
+
+    # Scan for balanced closing delimiter, tracking depth
+    end_pattern = make_flexible_pattern(cd)
+    i = inner_start
+    depth = 0
+
+    while i < search_end:
+        # Try to match opening pattern at current position
+        m_od = re.match(start_pattern, text[i:search_end], flags=re.DOTALL)
+        if m_od:
+            depth += 1
+            i += len(m_od.group())
+            continue
+
+        # Try to match closing pattern at current position
+        m_cd = re.match(end_pattern, text[i:search_end], flags=re.DOTALL)
+        if m_cd:
+            if depth == 0:
+                region_end = i + len(m_cd.group())
+                region_text = text[region_start:region_end]
+
+                # Extend to trailing newline using escaped_text
+                extended_end = extend_match_for_trailing_newline(
+                    escaped_text, region_end, search_end
+                )
+                region_end = extended_end
+
+                if debug:
+                    print(f"  START/END (balanced): [{region_start}:{region_end}]", file=sys.stderr)
+
+                return (region_text, region_start, region_end)
+
+            depth -= 1
+            i += len(m_cd.group())
+            continue
+
+        i += 1
+
+    if debug:
+        print(f"  END {cd!r}: NO MATCH", file=sys.stderr)
+    return None
+
+def match_delimiters(text, escaped_text, search_start, search_end, od, cd, debug):
+    result = find_balanced_delimiters(escaped_text, od, cd, search_start)
+
+    if not result or result[2] > search_end:
+        if debug:
+            print(f"  DELIM {od}{cd}: NO MATCH", file=sys.stderr)
+        return None
+
+    _, region_start, region_end = result
+    region_text = text[region_start:region_end]
+
+    extended_end = extend_match_for_trailing_newline(
+        escaped_text, region_end, search_end
+    )
+
+    if debug:
+        print(f"  DELIM {od}{cd}: [{region_start}:{extended_end}]", file=sys.stderr)
+
+    region_end = extended_end
+    return (region_text, region_start, region_end)
+
+def navigate_sequence(text, escaped_text, sequence,
+                      search_start=0, search_end=None,
+                      debug=False):
+    """
+    Navigate sequence within specified bounds.
+
+    Sequence tuples: (token, od, cd, is_target, all_inclusive, normal_match)
+      normal_match=False: search in escaped_text  (standard delimiters)
+      normal_match=True:  search in normal_text   (--start/--end markers)
+
+    Implements full backtracking via navigate_r():
+      When element[0] matches but the rest of the sequence fails (including
+      via delta-abort), element[0] is retried from the next position, so
+      an occurrence of a token inside a comment cannot permanently block the
+      match of the same token in real code.
+    """
+
+    if search_end is None:
+        search_end = len(text)
+
+    if debug:
+        print(f"SEQUENCE {sequence} search[{search_start}:{search_end}]", file=sys.stderr)
+
+    def navigate_r(seq, pos, last_abs_end, allinc_start, target):
+        """
+        Match seq[0] then recurse for seq[1:].
+
+        Parameters
+        ----------
+        seq          : remaining sequence elements to match
+        pos          : start position for the search of seq[0]
+        last_abs_end : end position of the previous element (for delta check);
+                       0 means "no previous element, skip delta check"
+        allinc_start : position where the all-inclusive region began, or None
+        target       : (text, start, end) of the current is_target match, or None
+
+        Returns
+        -------
+        (allinc_start, final_offset, target)  on success
+        None                                  on failure
+        """
+        if not seq:
+            return (allinc_start, pos, target)
+
+        token, od, cd, is_target, all_inclusive, normal_match = seq[0]
+
+        while True:
+            # -- Find the next candidate for seq[0] --------------------------
+            if token is not None:
+                match = match_token(text, pos, search_end, token, debug)
+            elif od is not None and cd is not None:
+                if normal_match:
+                    match = match_start_end(text, escaped_text,
+                                            pos, search_end, od, cd, debug)
+                else:
+                    match = match_delimiters(text, escaped_text,
+                                             pos, search_end, od, cd, debug)
+            else:
+                return None
+
+            if match is None:
+                return None          # no more candidates --> sequence fails
+
+            region_text, region_start, region_end = match
+
+            # -- Delta abort: non-whitespace between previous end and here ---
+            if last_abs_end:
+                delta = escaped_text[last_abs_end:region_start]
+                if delta and not delta.isspace():
+                    if debug:
+                        print(f"  DELTA [{last_abs_end}:{region_start}]: abort",
+                              file=sys.stderr)
+                    return None        # delta region only grows, retrying won't help
+
+            # -- Valid candidate: recurse for the rest of the sequence --------
+            if (all_inclusive and allinc_start is None):
+                new_allinc  = region_start
+            else:
+                new_allinc = allinc_start # no change
+
+            if is_target:
+                new_target  = (region_text, region_start, region_end)
+            else:
+                new_target = target # no change
+
+            result = navigate_r(seq[1:], region_end, region_end, new_allinc, new_target)
+
+            if result is not None:
+                return result
+
+            # -- Rest of sequence failed: backtrack, retry seq[0] ------------
+            if debug:
+                print(f"  BACKTRACK: retry from {region_end}", file=sys.stderr)
+            pos = region_end
+
+    result = navigate_r(sequence, search_start, 0, None, None)
+    if result is None:
+        return None
+
+    allinc_start, final_offset, target = result
+
+    if allinc_start is not None:
+        if debug:
+            print(f"  RESULT (allinc): [{allinc_start}:{final_offset}]", file=sys.stderr)
+        return (text[allinc_start:final_offset], allinc_start, final_offset)
+
+    if target is None:
+        return None
+
+    # target_text, target_start, target_end = target
+    # if debug:
+    #     print(f"  RESULT (target): [{target_start}:{target_end}]", file=sys.stderr)
+    # return (target_text, target_start, target_end)
+
+    if debug:
+        target_text, target_start, target_end = target
+        print(f"  RESULT (target): [{target_start}:{target_end}]", file=sys.stderr)
+    return target
+
+
+# -- Input processing --------------------------------------------------------
+
+def process_input(text, escaped_text, sequences, debug=False):
+    """Navigate regions using nested zooming with ordered operations."""
+    regions = []
+
+    def process_input_r(search_start, search_end, seqs, level):
+        if not seqs:
+            return True
+
+        sequence = seqs[0]
+
+        if debug:
+            print(f"-- Level {level}: search[{search_start}:{search_end}]", file=sys.stderr)
+
+        while True:
+            result = navigate_sequence(text, escaped_text, sequence,
+                                       search_start, search_end, debug)
+
+            if result is None:
+                break
+
+            matched_text, region_start, region_end = result
+
+            if debug:
+                print(f"   MATCHED: [{region_start}:{region_end}] {matched_text[:30]!r}",
+                      file=sys.stderr)
+
+            regions.append((region_start, region_end))
+
+            # the +1 here prevents the same start token to be matched twice!
+            if process_input_r(region_start + 1, region_end, seqs[1:], level + 1):
+                return True
+
+            regions.pop()
+            search_start = region_end
+
+        return False
+
+    if not process_input_r(0, len(text), sequences, 1):
+        raise RegionNotFoundError("Could not find region")
+
+    # if sequences:
+    #     if not process_input_r(0, len(text), sequences, 1):
+    #         raise RegionNotFoundError("Could not find region")
+
+    # if not regions:
+    #     raise RuntimeError("No operations found")
+
+    return regions
+
+
+# -- Output processing -------------------------------------------------------
+
+def process_output(regions, text, transforms, preview_levels):
+    if regions:
+        inner_start, inner_end = regions[-1]
+    else:
+        inner_start, inner_end = 0, len(text)
+
+    any_matched = False
+    # text is already the original text
+
+    if transforms:
+        region = text[inner_start:inner_end]
+        for t_type, t_expr in transforms:
+            if   t_type == 'regex':     region, matched = apply_regex_transform(region, t_expr)
+            elif t_type == 'literal':   region, matched = apply_literal_transform(region, t_expr)
+            elif t_type == 'exec':      region, matched = apply_exec_transform(region, t_expr)
+            elif t_type == 'template':  region, matched = apply_template_transform(t_expr)
+            else:                       raise ValueError(f"Unknown transform type: {t_type!r}")
+            if matched:
+                any_matched = True
+
+        delta = len(region) - (inner_end - inner_start)
+        text = text[:inner_start] + region + text[inner_end:]
+        updated = [(s, e + delta) for s, e in regions[:-1]]
+        if regions:
+            updated.append((inner_start, inner_start + len(region)))
+        regions = updated
+
+    if preview_levels is not None:
+        output = build_colored_output_with_zoom(text, regions, preview_levels)
+    else:
+        output = text
+
+    exit_code = (0 if any_matched else 1) if transforms else 0
+    return output, exit_code
+
+
+def build_colored_output_with_zoom(text, regions, preview_levels):
+    if not regions:
+        return COLORS[0] + text + RESET
+
+    n = len(regions)
+    if preview_levels == 0:
+        s, e = regions[-1]
+        return COLORS[0] + text[s:e] + RESET
+
+    first = max(0, n - preview_levels - 1)
+    last  = n - 1
+    events = []
+    for idx in range(first, last + 1):
+        s, e = regions[idx]
+        dist  = n - 1 - idx
+        color = dist if dist < len(COLORS) else -1
+        events += [(s, 0, 'start', color), (e, 1, 'end', color)]
+    events.sort()
+
+    result, pos, active = [], regions[first][0], []
+    for ep, _, kind, color in events:
+        result.append(text[pos:ep])
+        pos = ep
+        if kind == 'start':
+            if 0 <= color < len(COLORS): result.append(COLORS[color])
+            active.append(color)
+        else:
+            result.append(RESET)
+            if active and active[-1] == color: active.pop()
+            if active and 0 <= active[-1] < len(COLORS): result.append(COLORS[active[-1]])
+
+    result.append(text[pos:regions[last][1]])
+    return ''.join(result)
+
+
+
+def safe_decode(data):
+    """
+    Decode bytes as UTF-8, falling back to Latin-1 if UTF-8 fails.
+    Returns (text, detected_encoding) tuple.
+    Tier I:  Valid UTF-8  -> ('utf-8')
+    Tier II: Not UTF-8    -> fall back to Latin-1 ('latin-1')
+    Latin-1 never fails (all byte values 0x00-0xFF map to Unicode).
+    """
+    try:
+        return data.decode('utf-8'), 'utf-8'
+    except UnicodeDecodeError:
+        return data.decode('latin-1'), 'latin-1'
+
+
+def safe_decode_simple(data):
+    """
+    Decode bytes as UTF-8, falling back to Latin-1 if UTF-8 fails.
+    Returns text only (for use where encoding tracking is not needed,
+    e.g. archive members, templates).
+    """
+    text, _ = safe_decode(data)
+    return text
+
+def strip_bom(text):
+    """
+    Remove Byte Order Mark (BOM) from the beginning of text.
+    Handles UTF-8 BOM and other common BOMs.
+    """
+    # UTF-8 BOM
+    UTF8_BOM_STR = '\ufeff'
+    if text.startswith(UTF8_BOM_STR):
+        return text[1:]
+    return text
+
+
+def safe_encode(text, detected_encoding='utf-8', label='<unknown>'):
+    """
+    Encode text to bytes using the 3-tier encoding strategy:
+
+    Tier I:   detected_encoding == 'utf-8'
+              -> encode as UTF-8 (no change)
+
+    Tier II:  detected_encoding == 'latin-1' and result fits in Latin-1
+              -> encode as Latin-1 (preserve original encoding)
+
+    Tier III: detected_encoding == 'latin-1' but result contains chars
+              outside Latin-1 (e.g. from a UTF-8 template)
+              -> encode as UTF-8 with a warning to stderr
+    """
+    if detected_encoding == 'utf-8':
+        # Tier I: file was UTF-8, write UTF-8
+        return text.encode('utf-8')
+    else:
+        # Tier II: try to preserve original Latin-1 encoding
+        try:
+            return text.encode('latin-1')
+        except UnicodeEncodeError:
+            # Tier III: can't encode back to Latin-1, fall back to UTF-8 with warning
+            print(f"WARNING: {label}: output contains characters outside Latin-1, "
+                  f"converting to UTF-8", file=sys.stderr)
+            return text.encode('utf-8')
+
+
+# -- Tar and zip archive support ---------------------------------------------
+
+def get_archive_type(archive_path):
+    """Return 'tar' or 'zip', or raise ValueError for unsupported extension."""
+    p = archive_path.lower()
+    if p.endswith('.zip'):
+        return 'zip'
+    elif (p.endswith('.tar') or p.endswith('.tar.gz') or p.endswith('.tgz')
+          or p.endswith('.tar.bz2') or p.endswith('.tbz2')):
+        return 'tar'
+    else:
+        raise ValueError(
+            f"Archive {archive_path!r} must have .tar, .tar.gz, .tar.bz2, or .zip suffix"
+        )
+
+
+def get_tar_mode(archive_path):
+    """Return (read_mode, write_mode) for the given archive filename."""
+    p = archive_path.lower()
+    if p.endswith('.tar.gz') or p.endswith('.tgz'):
+        return 'r:gz', 'w:gz'
+    elif p.endswith('.tar.bz2') or p.endswith('.tbz2'):
+        return 'r:bz2', 'w:bz2'
+    elif p.endswith('.tar'):
+        return 'r:', 'w:'
+    else:
+        raise ValueError(
+            f"Archive {archive_path!r} must have .tar, .tar.gz, or .tar.bz2 suffix"
+        )
+
+
+def extract_archive_file(archive_path, target_path):
+    """
+    Read a single file from a tar or zip archive.
+
+    Returns (text, detected_encoding) tuple.
+    Raises KeyError  if target_path is not in the archive.
+    Raises ValueError if target_path is not a regular file.
+    """
+    if get_archive_type(archive_path) == 'zip':
+        with zipfile.ZipFile(archive_path, 'r') as zf:
+            try:
+                info = zf.getinfo(target_path)
+            except KeyError:
+                raise KeyError(f"File not found in archive: {target_path!r}")
+            if info.is_dir():
+                raise ValueError(f"{target_path!r} is not a regular file in the archive")
+            text, enc = safe_decode(zf.read(target_path)); return text, enc
+    else:
+        read_mode, _ = get_tar_mode(archive_path)
+        with tarfile.open(archive_path, read_mode) as tar:
+            try:
+                member = tar.getmember(target_path)
+            except KeyError:
+                raise KeyError(f"File not found in archive: {target_path!r}")
+            if not member.isfile():
+                raise ValueError(f"{target_path!r} is not a regular file in the archive")
+            text, enc = safe_decode(tar.extractfile(member).read()); return text, enc
+
+
+def write_archive_file(archive_path, modifications, backup_suffix):
+    """
+    Rewrite a tar or zip archive with modified file contents.
+
+    modifications : dict {member_path: new_content_string}
+
+    All other members are copied verbatim (metadata + content).
+    Modified members get new content; metadata is preserved except size (tar only).
+    Uses atomic write: write to a temp file then os.replace().
+    If backup_suffix is non-empty, a backup of the original is made first.
+    """
+    if backup_suffix:
+        backup = archive_path + backup_suffix
+        try:
+            import shutil
+            shutil.copy2(archive_path, backup)
+        except OSError as e:
+            raise OSError(f"Cannot create backup {backup!r}: {e}") from e
+
+    archive_dir = os.path.dirname(os.path.abspath(archive_path))
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=archive_dir)
+
+    try:
+        os.close(tmp_fd)
+        if get_archive_type(archive_path) == 'zip':
+            with zipfile.ZipFile(archive_path, 'r') as reader, \
+                 zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED) as writer:
+                for item in reader.infolist():
+                    if item.filename in modifications:
+                        output, detected_encoding = modifications[item.filename]
+                        writer.writestr(item, safe_encode(output, detected_encoding, item.filename))
+                    else:
+                        writer.writestr(item, reader.read(item.filename))
+        else:
+            read_mode, write_mode = get_tar_mode(archive_path)
+            with tarfile.open(archive_path, read_mode) as reader, \
+                 tarfile.open(tmp_path, write_mode) as writer:
+
+                for member in reader.getmembers():
+                    if member.name in modifications and member.isfile():
+                        import copy
+                        output, detected_encoding = modifications[member.name]
+                        new_bytes = safe_encode(output, detected_encoding, member.name)
+                        new_member = copy.copy(member)
+                        new_member.size = len(new_bytes)
+                        writer.addfile(new_member, io.BytesIO(new_bytes))
+                    elif member.isfile():
+                        writer.addfile(member, reader.extractfile(member))
+                    else:
+                        # Directories, symlinks, devices, etc.
+                        writer.addfile(member)
+
+        os.replace(tmp_path, archive_path)
+
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+
+# -- Atomic in-place write ---------------------------------------------------
+
+def write_in_place(source, output_bytes, backup_suffix):
+    """Write output_bytes to source atomically using a temp file + rename."""
+    source_dir = os.path.dirname(os.path.abspath(source))
+
+    if backup_suffix:
+        backup = source + backup_suffix
+        try:
+            import shutil
+            shutil.copy2(source, backup)
+        except OSError as e:
+            raise OSError(f"Cannot create backup {backup!r}: {e}") from e
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=source_dir)
+    try:
+        with os.fdopen(tmp_fd, 'wb') as fh:
+            fh.write(output_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, source)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# -- Parse command line preserving order -------------------------------------
+
+def parse_operations_from_argv():
+    """
+    Parse sys.argv to extract operations in order.
+
+    Returns:
+      sequences: List of sequence elements to match
+      transforms: List of (type, expr) tuples
+
+    Preserves order of -z, -s, -e operations.
+    """
+    sequences = []
+    transforms = []
+
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+
+        if arg in ('-z', '--zoom'):
+            if i + 1 >= len(sys.argv):
+                raise ValueError(f"{arg} requires an argument")
+            defn = sys.argv[i + 1]
+            sequences.append(parse_definition_with_marker(defn))
+            i += 2
+
+        elif arg in ('-s', '--start'):
+            if i + 1 >= len(sys.argv):
+                raise ValueError(f"{arg} requires an argument")
+            start_pat = sys.argv[i + 1]
+
+            # Must have matching --end (it can come later)
+            # Look ahead for --end
+            end_pat = None
+            j = i + 2
+            while j < len(sys.argv):
+                if sys.argv[j] in ('-e', '--end'):
+                    if j + 1 >= len(sys.argv):
+                        raise ValueError(f"{sys.argv[j]} requires an argument")
+                    end_pat = sys.argv[j + 1]
+                    # Remove these from argv so they're not processed again
+                    del sys.argv[j:j+2]
+                    break
+                j += 1
+
+            if end_pat is None:
+                raise ValueError(f"--start requires matching --end")
+
+            if start_pat == end_pat:
+                raise ValueError("--start and --end must have different values")
+
+            # Create special start/end sequence tuple with normal_match=True
+            sequences.append([(None, start_pat, end_pat, True, True, True)])
+            i += 2
+
+        elif arg in ('-e', '--end'):
+            raise ValueError("--end must follow --start")
+
+        elif arg in ('-r', '--regex'):
+            if i + 1 >= len(sys.argv):
+                raise ValueError(f"{arg} requires an argument")
+            transforms.append(('regex', sys.argv[i + 1]))
+            i += 2
+
+        elif arg in ('-l', '--literal'):
+            if i + 1 >= len(sys.argv):
+                raise ValueError(f"{arg} requires an argument")
+            transforms.append(('literal', sys.argv[i + 1]))
+            i += 2
+
+        elif arg in ('-x', '--exec'):
+            if i + 1 >= len(sys.argv):
+                raise ValueError(f"{arg} requires an argument")
+            transforms.append(('exec', sys.argv[i + 1]))
+            i += 2
+
+        else:
+            i += 1
+
+    return sequences, transforms
+
+
+# -- Main --------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(prog='zmr', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    #description="Zoom and Replace")
+    parser.add_argument('-z', '--zoom', metavar='DEF')
+    parser.add_argument('-s', '--start', metavar='PAT')
+    parser.add_argument('-e', '--end', metavar='PAT')
+    parser.add_argument('-r', '--regex', metavar='EXPR')
+    parser.add_argument('-l', '--literal', metavar='EXPR')
+    parser.add_argument('-x', '--exec', metavar='CMD')
+    parser.add_argument('-t', '--template', metavar='TEMPLATE', dest='template', default=None)
+    parser.add_argument('-p', '--preview', type=int, default=None, metavar='LEVELS')
+    parser.add_argument('-a', '--archive', dest='archive', default=None, metavar='ARCHIVE')
+    parser.add_argument('-i', '--in-place', nargs='?', const='', default=None, metavar='SUFFIX')
+    parser.add_argument('-d', '--debug', action='store_true')
+    parser.add_argument('files', nargs='*', metavar='FILE')
+    parser.add_argument('-v', '--version', action='version', version=f'%(prog)s {__version__}')
+
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        sys.exit(e.code)
+
+    if args.preview is not None and args.preview < 0:
+        print("ERROR: -p value must be non-negative", file=sys.stderr)
+        sys.exit(2)
+    if args.preview is not None and args.in_place is not None:
+        print("ERROR: -p and -i cannot be used together", file=sys.stderr)
+        sys.exit(2)
+    # argparse nargs='?' may consume the first FILE as the -i suffix when they
+    # are adjacent (e.g. -i src/main.js).  Detect this: a legitimate backup
+    # suffix never contains '/' or starts with a letter followed by '/'.
+    if args.in_place and (args.in_place.startswith('/') or '/' in args.in_place):
+        args.files = [args.in_place] + list(args.files)
+        args.in_place = ''
+
+    if args.in_place is not None and not args.files:
+        print("ERROR: -i requires at least one filename", file=sys.stderr)
+        sys.exit(2)
+    if args.archive is not None and not args.files:
+        print("ERROR: -a requires at least one file path (within archive)", file=sys.stderr)
+        sys.exit(2)
+    if args.archive is not None:
+        try:
+            get_archive_type(args.archive) # called for side-effects (might raise a ValueError)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+        if not os.path.isfile(args.archive):
+            print(f"ERROR: Archive not found: {args.archive!r}", file=sys.stderr)
+            sys.exit(2)
+
+    # Validate -t / --template
+    if args.template is not None and args.template not in [':', '-']:
+        if not os.path.exists(args.template):
+            print(f"ERROR: -t template not found: {args.template!r}", file=sys.stderr)
+            sys.exit(2)
+
+    if not args.files and  args.template == '-':
+        print(f"ERROR: -t - option cannot be used when stdin is already used as input",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Parse operations in command-line order
+    try:
+        sequences, transforms = parse_operations_from_argv()
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # if not sequences:
+    #     print("ERROR: at least one of -z or -s/--end is required", file=sys.stderr)
+    #     sys.exit(2)
+
+    # Prepend -t as first transform if specified
+    if args.template is not None:
+        transforms = [('template', args.template)] + transforms
+
+    # Validate transforms
+    for t_type, t_expr in transforms:
+        if t_type in ('regex', 'literal'):
+            try:
+                parse_substitution_expr(t_expr)
+            except ValueError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                sys.exit(2)
+
+    sources = args.files if args.files else [None]
+    overall_exit = 0
+
+    # When writing multiple files back to the same archive we collect all
+    # modifications and do a single atomic rewrite at the end.
+    archive_modifications = {}   # {member_path: new_content_str}  (only used with -a -i)
+
+    for source in sources:
+        if source is None:
+            try:
+                text, detected_encoding = safe_decode(sys.stdin.buffer.read())
+            except KeyboardInterrupt:
+                sys.exit(2)
+            label = '<stdin>'
+        elif args.archive is not None:
+            try:
+                text, detected_encoding = extract_archive_file(args.archive, source)
+            except (KeyError, ValueError, OSError) as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                sys.exit(2)
+            label = f"{args.archive}:{source}"
+        else:
+            try:
+                with open(source, 'rb') as fh:
+                    text, detected_encoding = safe_decode(fh.read())
+            except OSError as e:
+                print(f"ERROR: Cannot read {source!r}: {e}", file=sys.stderr)
+                sys.exit(2)
+            label = source
+
+        try:
+            escaped_text = escape_literals(text)
+
+            if args.debug:
+                print(f"=== ESCAPED TEXT ===\n{escaped_text}\n=== END ESCAPED ===",
+                      file=sys.stderr)
+                print(f"=== NORMAL TEXT ===\n{text}\n=== END NORMAL ===",  # for reference
+                      file=sys.stderr)
+
+            regions = process_input(text, escaped_text, sequences, args.debug)
+            output, exit_code = process_output(regions, text, transforms, args.preview)
+
+        except RegionNotFoundError:
+            if transforms:
+                overall_exit = 1
+                continue
+            print(f"ERROR: {label}: Could not find region", file=sys.stderr)
+            sys.exit(2)
+        except RuntimeError as e:
+            print(f"ERROR: {label}: {e}", file=sys.stderr)
+            sys.exit(2)
+        except ValueError as e:
+            print(f"ERROR: {label}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        if exit_code > overall_exit:
+            overall_exit = exit_code
+
+        if args.in_place is not None and args.archive is not None:
+            # Accumulate; write the archive once after all files are processed
+            archive_modifications[source] = (output, detected_encoding)
+        elif args.in_place is not None:
+            try:
+                output_bytes = safe_encode(output, detected_encoding, label)
+                write_in_place(source, output_bytes, args.in_place)
+            except OSError as e:
+                print(f"ERROR: {label}: {e}", file=sys.stderr)
+                sys.exit(2)
+        else:
+            output_bytes = safe_encode(output, detected_encoding, label)
+            sys.stdout.buffer.write(output_bytes)
+
+    # Write all modifications back to the archive in a single atomic pass
+    if archive_modifications:
+        try:
+            write_archive_file(args.archive, archive_modifications, args.in_place)
+        except OSError as e:
+            print(f"ERROR: Cannot update archive {args.archive!r}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    sys.exit(overall_exit)
+
+
+if __name__ == "__main__":
+    main()
