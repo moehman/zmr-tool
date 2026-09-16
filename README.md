@@ -40,7 +40,7 @@ $ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c 
 If we drop the underscore from the patterns, we get a slightly larger match which is best illustrated in the preview mode (`-p0`):
 ```
 $ zmr -z 'void bar(int i) {}' -z 'while (i--) {}' -r 's/world/WORLD/' hello.c -p0
-while (i--) {
+  while (i--) {
     printf("WORLD\n");
   }
 ```
@@ -72,7 +72,7 @@ void foo() {
 Leaving out the underscore from the zoom patterns means that whole pattern is matched from start to finish:
 ```
 $ zmr -z 'if ($x) {} elseif ($y) {} else {}' < elseif.php -p0
-if ($x) {
+  if ($x) {
     cmd1();
   } elseif ($y) {
     cmd2();
@@ -92,7 +92,7 @@ $ zmr -z 'if ($x) {} elseif ($y) {_} else {}' < elseif.php -p0
 Instead of the regular zoom patters, a similar effect can be achieved with the `-s (--start)` and `-e (--end)` options:
 ```
 $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p0
-<A>  # 2 OPEN
+  <A>  # 2 OPEN
     <B></B>  # 3 OPEN AND CLOSE
   </A>
 ```
