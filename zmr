@@ -317,7 +317,7 @@ def parse_definition_with_marker(definition):
         raise ValueError("Definition contains no marker types")
 
     # Check for repeated marker patterns
-    if definition.count(marker_info) > 1:
+    if marker_info in ['{_}', '(_)', '[_]'] and definition.count(marker_info) > 1:
         raise ValueError(f"Definition contains repeated marker: {marker_info}")
 
     if definition in ('{_}', '(_)', '[_]', '{}', '()', '[]'):
