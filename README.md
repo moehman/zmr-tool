@@ -19,7 +19,7 @@ zmr (zoomer) is a zoom-and-replace tool for navigating and transforming nested c
 
 ### 2.1 Zooming
 
-Preview mode (-p0) shows the matched region in red color (which not supported by the .md format):
+Preview mode (`-p0`) shows the matched region in red color (which not supported by the `.md` format):
 ```bash
 $ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c -p0
 {
@@ -27,7 +27,7 @@ $ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c 
   }
 ```
 
-Preview mode (-p1) shows the matched region in red and the surrounding region in green so we see a little more context:
+Preview mode (`-p1`) shows the matched region in red and the surrounding region in green so we see a little more context:
 ```
 $ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c -p1
 {
@@ -37,7 +37,7 @@ $ zmr -z 'void bar(int i) {_}' -z 'while (i--) {_}' -r 's/world/WORLD/' hello.c 
 }
 ```
 
-If we drop the underscore from the patterns, we get a slightly larger match which is best illustrated in the preview mode (-p0):
+If we drop the underscore from the patterns, we get a slightly larger match which is best illustrated in the preview mode (`-p0`):
 ```
 $ zmr -z 'void bar(int i) {}' -z 'while (i--) {}' -r 's/world/WORLD/' hello.c -p0
 while (i--) {
@@ -45,7 +45,7 @@ while (i--) {
   }
 ```
 
-Again, preview mode (-p1) shows not only the matching region (in red) but also the surrounding region (in green):
+Again, preview mode (`-p1`) shows not only the matching region (in red) but also the surrounding region (in green):
 ```
 $ zmr -z 'void bar(int i) {}' -z 'while (i--) {}' -r 's/world/WORLD/' hello.c -p1
 void bar(int i) {
@@ -61,7 +61,7 @@ $ zmr -z 'void foo() {}' -r 's/hello/HELLO/' hello.c -p0
 ERROR: Definition contains multiple marker types
 ```
 
-If we want to match a literal '()' from the file, we can write it with an extra space in between, i.e. '( )', because the zoom pattern matching engine ignores white space unless it introduces a new word boundaries just like many compilers do:
+If we want to match a literal `()` from the file, we can write it with an extra space in between, i.e. `( )`, because the zoom pattern matching engine ignores white space unless it introduces a new word boundaries just like many compilers do:
 ```
 $ zmr -z 'void foo( ) {}' -r 's/hello/HELLO/' hello.c -p0
 void foo() {
@@ -89,7 +89,7 @@ $ zmr -z 'if ($x) {} elseif ($y) {_} else {}' < elseif.php -p0
   }
 ```
 
-Instead of the regular zoom patters, a similar effect can be achieved with the -s (--start) and -e (--end) options:
+Instead of the regular zoom patters, a similar effect can be achieved with the `-s (--start)` and `-e (--end)` options:
 ```
 $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p0
 <A>  # 2 OPEN
@@ -97,7 +97,7 @@ $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p0
   </A>
 ```
 
-There are far better tools for processing XML files and the purpose of these examples is to show that the concept of nested regions maps cleanly to tree-like structures:
+There are far better tools for processing XML files, and the purpose of these examples is to show that the concept of nested regions maps cleanly to tree-like structures:
 ```
 $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p1
 <a>  # 1 open
@@ -109,7 +109,7 @@ $ zmr -s '<a>' -e '</a>' -s '<a>' -e '</a>' -x 'tr a-z A-Z' < test.xml -p1
 
 ### 2.2 Transforming
 
-We can pipe the selected region through an external command with the -x (--exec) option:
+We can pipe the selected region through an external command with the `-x (--exec)` option:
 ```
 $ zmr -z 'int main(int argc, char *argv[]) {_}' -z 'if (strcmp(argv[1], "help") == 0) {_}' -x 'tr a-z A-Z' < hello.c -p1
 {
@@ -126,7 +126,7 @@ $ zmr -z 'int main(int argc, char *argv[]) {_}' -z 'if (strcmp(argv[1], "help") 
 }
 ```
 
-Templates can be read from a file or from stdin just like the input files:
+Templates can be read from a file or from `stdin` just like the input files:
 ```
 $ zmr -z 'void foo() {_}' -t templates/foo_body.c < hello.c -p0
   printf("goodbye!\n");
@@ -140,15 +140,15 @@ $ zmr -z 'void foo() {_}' -t templates/foo_body.c -x 'tr a-z A-Z' < hello.c -p0
   PRINTF("GOODBYE!\N");
 ```
 
-The special value ':' for an empty template was inspired by the : no-op shell command. These two are equivalent except that the -t parameter does not launch an external process:
+The special value `:` for an empty template was inspired by the `:` no-op shell command. These two are equivalent except that the `-t` parameter does not launch an external process:
 ```
-$ zmr -z 'void foo( ) {}' -x ':' hello.c -p0    # removes the foo() function with a process the returns nothing
-$ zmr -z 'void foo( ) {}' -t ':' hello.c -p0    # removes the foo() function by substitution with an empty template
+$ zmr -z 'void foo( ) {}' -x ':' hello.c -p0    # removes foo() with a process the returns nothing
+$ zmr -z 'void foo( ) {}' -t ':' hello.c -p0    # removes foo() by substituting an empty template
 ```
 
 ### 2.3 Working with Archive Files
 
-Editing a file inside a zip archive (change the -p0 flag to -i flag to actually write the changes to the archive):
+Editing a file inside a zip archive (change the `-p0` flag to `-i` flag to actually write the changes to the archive):
 ```
 $ zmr -a test.zip -z 'function hello() {_}' -r 's/TODO/DONE/' src/main.js -p0
 {
@@ -157,7 +157,7 @@ $ zmr -a test.zip -z 'function hello() {_}' -r 's/TODO/DONE/' src/main.js -p0
 }
 ```
 
-In addition to .zip files, also tar and .tar.gz files are supported. It is also possible to peek inside archives without even specifying any zoom patterns or translations:
+In addition to `.zip` files, also `.tar` and `.tar.gz` files are supported. It is also possible to peek inside archives without even specifying any zoom patterns or translations:
 ```
 $ zmr -a test.tar.gz src/main.js
 function hello() {
