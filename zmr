@@ -76,7 +76,7 @@ Examples:
     zmr -z 'function getBackups() {}' -r 's/__DATE__/2026-09-02/' src/file.php -i -t - <<< "$PATCH"
     zmr -a archive.zip -z 'function foo() {_}' -r 's/old/new/g' src/main.js -i
 
-Version: 6.0.2
+Version: 6.0.4
 """
 
 import sys, os, io, tempfile, subprocess, re, argparse, tarfile, zipfile
@@ -86,7 +86,7 @@ class RegionNotFoundError(Exception):
     """Raised when zoom definitions do not match anything in the input."""
     pass
 
-__version__ = '6.0.2'
+__version__ = '6.0.4'
 COLORS  = ["\033[91m", "\033[92m", "\033[94m"]
 RESET   = "\033[0m"
 
@@ -161,7 +161,7 @@ def find_balanced_delimiters(text, open_d, close_d, start_pos=0):
             i += len(open_d)
         elif i + len(close_d) <= len(text) and text[i:i+len(close_d)] == close_d:
             if depth == 0:
-                return (text[pos:i+len(close_d)], pos, i+len(close_d))
+                return (pos, i+len(close_d))
             depth -= 1
             i += len(close_d)
         else:
@@ -255,8 +255,6 @@ def apply_exec_transform(text, cmd):
     return proc.stdout, proc.stdout != text
 
 
-
-
 def apply_template_transform(file_path):
     """
     Replace region with contents of file_path.
@@ -318,6 +316,10 @@ def parse_definition_with_marker(definition):
     if marker_info is None:
         raise ValueError("Definition contains no marker types")
 
+    # Check for repeated marker patterns
+    if definition.count(marker_info) > 1:
+        raise ValueError(f"Definition contains repeated marker: {marker_info}")
+
     if definition in ('{_}', '(_)', '[_]', '{}', '()', '[]'):
         od, cd = marker_delim
         return [(None, od, cd, True, all_inclusive, False)]
@@ -343,7 +345,31 @@ def parse_definition_with_marker(definition):
 
 # -- Match Extension --------------------------------------------------------
 
-def extend_match_for_trailing_newline(text, region_end, search_end):
+def extend_match_for_leading_newline(text, region_start):
+    """
+    Extend region backward to include leading whitespace and newline.
+
+    Extends backward from region_start, skipping whitespace (space/tab/form-feed).
+    If a newline is found, returns position after that newline (new region_start).
+    If any non-whitespace is found before a newline, returns region_start unchanged.
+    """
+    pos = region_start - 1
+
+    while pos >= 0:
+        ch = text[pos]
+        if ch == '\n':
+            return pos + 1
+        elif ch in ' \t\f\r':
+            pos -= 1
+        else:
+            # Non-whitespace blocks extension
+            return region_start
+
+    # Reached beginning of file without finding newline - don't extend
+    return region_start
+
+
+def extend_match_for_trailing_newline(text, region_end):
     """
     Extend region to include trailing whitespace and newline.
 
@@ -351,7 +377,7 @@ def extend_match_for_trailing_newline(text, region_end, search_end):
     """
     end = region_end
 
-    while end < search_end:
+    while end < len(text):
         ch = text[end]
         if ch == '\n':
             return end + 1
@@ -376,14 +402,21 @@ def match_token(text, search_start, search_end, token, debug):
             print(f"  TOKEN {token}: NO MATCH", file=sys.stderr)
         return None
 
-    region_text  = match.group()
+#   region_text  = match.group()
     region_start = search_start + match.start()
     region_end   = search_start + match.end()
 
+    # Extend to leading and trailing newline
+    extended_start = extend_match_for_leading_newline(text, region_start)
+    extended_end = extend_match_for_trailing_newline(text, region_end)
+
     if debug:
         print(f"  TOKEN {token}: [{region_start}:{region_end}]", file=sys.stderr)
+        print(f"  TOKEN {token}: [{extended_start}:{extended_end}] (EXT)", file=sys.stderr)
 
-    return (region_text, region_start, region_end)
+    region_start = extended_start
+    region_end = extended_end
+    return (region_start, region_end)
 
 def match_start_end(text, escaped_text, search_start, search_end, od, cd, debug):
     # Search for start and end patterns in normal_text with balanced nesting
@@ -418,18 +451,19 @@ def match_start_end(text, escaped_text, search_start, search_end, od, cd, debug)
         if m_cd:
             if depth == 0:
                 region_end = i + len(m_cd.group())
-                region_text = text[region_start:region_end]
 
-                # Extend to trailing newline using normal text (where start/end patterns matched)
-                extended_end = extend_match_for_trailing_newline(
-                    text, region_end, search_end
-                )
-                region_end = extended_end
+                # Extend to leading and trailing newline using normal
+                # text (where start/end patterns matched)
+                extended_start = extend_match_for_leading_newline(text, region_start)
+                extended_end = extend_match_for_trailing_newline(text, region_end)
 
                 if debug:
                     print(f"  START/END (balanced): [{region_start}:{region_end}]", file=sys.stderr)
+                    print(f"  START/END (balanced): [{extended_start}:{extended_end}] (EXT)", file=sys.stderr)
 
-                return (region_text, region_start, region_end)
+                region_start = extended_start
+                region_end = extended_end
+                return (region_start, region_end)
 
             depth -= 1
             i += len(m_cd.group())
@@ -444,23 +478,24 @@ def match_start_end(text, escaped_text, search_start, search_end, od, cd, debug)
 def match_delimiters(text, escaped_text, search_start, search_end, od, cd, debug):
     result = find_balanced_delimiters(escaped_text, od, cd, search_start)
 
-    if not result or result[2] > search_end:
+    if not result or result[1] > search_end:
         if debug:
             print(f"  DELIM {od}{cd}: NO MATCH", file=sys.stderr)
         return None
 
-    _, region_start, region_end = result
-    region_text = text[region_start:region_end]
+    region_start, region_end = result
 
-    extended_end = extend_match_for_trailing_newline(
-        escaped_text, region_end, search_end
-    )
+    # Extend to leading and trailing newline
+    extended_start = extend_match_for_leading_newline(escaped_text, region_start)
+    extended_end = extend_match_for_trailing_newline(escaped_text, region_end)
 
     if debug:
-        print(f"  DELIM {od}{cd}: [{region_start}:{extended_end}]", file=sys.stderr)
+        print(f"  DELIM {od}{cd}: [{region_start}:{region_end}]", file=sys.stderr)
+        print(f"  DELIM {od}{cd}: [{extended_start}:{extended_end}] (EXT)", file=sys.stderr)
 
+    region_start = extended_start
     region_end = extended_end
-    return (region_text, region_start, region_end)
+    return (region_start, region_end)
 
 def navigate_sequence(text, escaped_text, sequence,
                       search_start=0, search_end=None,
@@ -525,7 +560,7 @@ def navigate_sequence(text, escaped_text, sequence,
             if match is None:
                 return None          # no more candidates --> sequence fails
 
-            region_text, region_start, region_end = match
+            region_start, region_end = match
 
             # -- Delta abort: non-whitespace between previous end and here ---
             if last_abs_end:
@@ -543,7 +578,7 @@ def navigate_sequence(text, escaped_text, sequence,
                 new_allinc = allinc_start # no change
 
             if is_target:
-                new_target  = (region_text, region_start, region_end)
+                new_target  = (region_start, region_end)
             else:
                 new_target = target # no change
 
@@ -566,18 +601,10 @@ def navigate_sequence(text, escaped_text, sequence,
     if allinc_start is not None:
         if debug:
             print(f"  RESULT (allinc): [{allinc_start}:{final_offset}]", file=sys.stderr)
-        return (text[allinc_start:final_offset], allinc_start, final_offset)
-
-    if target is None:
-        return None
-
-    # target_text, target_start, target_end = target
-    # if debug:
-    #     print(f"  RESULT (target): [{target_start}:{target_end}]", file=sys.stderr)
-    # return (target_text, target_start, target_end)
+        return (allinc_start, final_offset)
 
     if debug:
-        target_text, target_start, target_end = target
+        target_start, target_end = target
         print(f"  RESULT (target): [{target_start}:{target_end}]", file=sys.stderr)
     return target
 
@@ -586,7 +613,7 @@ def navigate_sequence(text, escaped_text, sequence,
 
 def process_input(text, escaped_text, sequences, debug=False):
     """Navigate regions using nested zooming with ordered operations."""
-    regions = []
+    regions = [(0, len(text))]  # implicit region: entire file
 
     def process_input_r(search_start, search_end, seqs, level):
         if not seqs:
@@ -600,13 +627,13 @@ def process_input(text, escaped_text, sequences, debug=False):
         while True:
             result = navigate_sequence(text, escaped_text, sequence,
                                        search_start, search_end, debug)
-
             if result is None:
                 break
 
-            matched_text, region_start, region_end = result
+            region_start, region_end = result
 
             if debug:
+                matched_text = text[region_start:region_end]
                 print(f"   MATCHED: [{region_start}:{region_end}] {matched_text[:30]!r}",
                       file=sys.stderr)
 
@@ -624,13 +651,6 @@ def process_input(text, escaped_text, sequences, debug=False):
     if not process_input_r(0, len(text), sequences, 1):
         raise RegionNotFoundError("Could not find region")
 
-    # if sequences:
-    #     if not process_input_r(0, len(text), sequences, 1):
-    #         raise RegionNotFoundError("Could not find region")
-
-    # if not regions:
-    #     raise RuntimeError("No operations found")
-
     return regions
 
 
@@ -643,7 +663,6 @@ def process_output(regions, text, transforms, preview_levels):
         inner_start, inner_end = 0, len(text)
 
     any_matched = False
-    # text is already the original text
 
     if transforms:
         region = text[inner_start:inner_end]
@@ -707,7 +726,6 @@ def build_colored_output_with_zoom(text, regions, preview_levels):
     return ''.join(result)
 
 
-
 def safe_decode(data):
     """
     Decode bytes as UTF-8, falling back to Latin-1 if UTF-8 fails.
@@ -720,7 +738,6 @@ def safe_decode(data):
         return data.decode('utf-8'), 'utf-8'
     except UnicodeDecodeError:
         return data.decode('latin-1'), 'latin-1'
-
 
 def safe_decode_simple(data):
     """
@@ -741,7 +758,6 @@ def strip_bom(text):
     if text.startswith(UTF8_BOM_STR):
         return text[1:]
     return text
-
 
 def safe_encode(text, detected_encoding='utf-8', label='<unknown>'):
     """
@@ -891,7 +907,6 @@ def write_archive_file(archive_path, modifications, backup_suffix):
         except OSError:
             pass
         raise
-
 
 
 # -- Atomic in-place write ---------------------------------------------------
