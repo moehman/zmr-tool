@@ -465,7 +465,18 @@ zmr implements a 3-tier encoding strategy for handling mixed-encoding environmen
 
 ## 15. Version History
 
-### v6.0.2 (Latest)
+### v6.0.4 (Latest)
+
+- Improved region expansion algorithm
+- Before the region was extended to the end of line, if possible
+- Now the region is also extended to the beginning of the line, if possible
+
+### v6.0.3
+
+- Setting high enough preview level now reveals the entire file
+- Before the preview was limited to the outermost zoom region
+
+### v6.0.2
 
 - 3-tier encoding strategy for multi-encoding support (UTF-8, Latin-1 preservation, UTF-8+warn)
 - BOM stripping from template files
